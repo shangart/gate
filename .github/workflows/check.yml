@@ -2,6 +2,8 @@ name: VPN Gate Node Check
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
 
 permissions:
   contents: read
@@ -20,6 +22,79 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ------------------------------------------------------------------
+      # 新增: 先校验 Worker 地址, 配置不对立刻给出可读错误, 不再跑到
+      # "Worker 全部请求异常" 才失败; 并自动补全协议/路径、https 握手失败时降级 http
+      # ------------------------------------------------------------------
+      - name: Preflight - 校验检测 Worker 地址
+        env:
+          RAW_WORKER: ${{ secrets.DOMAIN }}
+        run: |
+          set -u
+
+          raw="$(printf '%s' "${RAW_WORKER:-}" | tr -d ' \t\r\n')"
+          if [ -z "$raw" ]; then
+            echo "::error title=缺少 Secret::仓库没有配置 secrets.DOMAIN。请到 Settings -> Secrets and variables -> Actions 新建, 值形如 https://xxx.workers.dev/check?sstp=vpn:vpn@"
+            exit 1
+          fi
+
+          base="$raw"
+          base="${base#http://}"
+          base="${base#https://}"
+          base="${base%/}"
+
+          case "$base" in
+            *"@") ;;
+            *"/check") base="${base}?sstp=vpn:vpn@" ;;
+            *"/check?sstp=") base="${base}vpn:vpn@" ;;
+            *)
+              echo "::error title=Worker 地址格式不对::需要以 /check?sstp=vpn:vpn@ 结尾, 当前为 ${raw}"
+              exit 1
+              ;;
+          esac
+
+          probe() {
+            curl -sS -m 30 -o /tmp/probe.json -w '%{http_code}' "$1" 2>/dev/null || true
+          }
+          show_probe() {
+            echo "--- probe 响应 (HTTP $1) ---"
+            head -c 300 /tmp/probe.json 2>/dev/null || true
+            echo
+          }
+
+          last=""
+          url=""
+
+          if [ "${raw#http://}" != "$raw" ]; then
+            # Secret 里明确写了 http://, 直接用, 但仍做存活探测
+            last="$(probe "http://${base}vpn.example.com:443")"
+            if [ "$last" = "200" ]; then
+              url="http://${base}"
+              echo "::warning title=使用明文 HTTP::检测流量不加密, 建议改用 https"
+            fi
+          else
+            last="$(probe "https://${base}vpn.example.com:443")"
+            if [ "$last" = "200" ]; then
+              url="https://${base}"
+            elif [ "$last" = "000" ]; then
+              echo "https 握手失败 (code 000), 自动降级 http 重试 ..."
+              last="$(probe "http://${base}vpn.example.com:443")"
+              if [ "$last" = "200" ]; then
+                url="http://${base}"
+                echo "::warning title=已自动降级为 HTTP::${base} 的 HTTPS 不可用 (典型原因: Cloudflare Universal SSL 不覆盖多级子域), 本次改用 http"
+              fi
+            fi
+          fi
+
+          if [ -z "$url" ]; then
+            show_probe "${last:-000}"
+            echo "::error title=检测 Worker 不可用::HTTP ${last:-000} —— 请确认 Worker 已部署、路径为 /check?sstp=vpn:vpn@、且没有被 Cloudflare Access/WAF 拦截"
+            exit 1
+          fi
+
+          echo "最终使用: ${url}"
+          echo "CHECK_WORKER=${url}" >> "$GITHUB_ENV"
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -29,10 +104,9 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Get VPN Gate nodes + check via Cloudflare Worker + build page
+        # CHECK_WORKER 由上面的 Preflight 通过 $GITHUB_ENV 传入, 这里不要再写
         run: python vpngate.py
         env:
-          # 已部署的检测 Worker (不要改动: 检测统一走这里)
-          CHECK_WORKER: ${{ secrets.DOMAIN }}
           CHECK_CONCURRENCY: "32"
           CHECK_TIMEOUT: "90"
 
@@ -68,4 +142,4 @@ jobs:
         uses: actions/deploy-pages@v4
 
       - name: Show site URL
-        run: 'echo "site: https://仓库用户名.github.io/gate/ (deploy outcome: ${{ steps.deployment.outcome }})"'
+        run: 'echo "site: https://${{ github.repository_owner }}.github.io/gate/ (deploy outcome: ${{ steps.deployment.outcome }})"'
